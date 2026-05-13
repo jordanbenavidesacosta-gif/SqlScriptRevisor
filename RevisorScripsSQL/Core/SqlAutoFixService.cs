@@ -1,9 +1,10 @@
-﻿using RevisorScripstSQL.Models;
+﻿using Microsoft.SqlServer.TransactSql.ScriptDom;
+using RevisorScripstSQL.Models;
 using RevisorScripstSQL.Rules.NoLock;
-using System.IO;
-using System.Text.RegularExpressions;
 using RevisorScripstSQL.Utilities;
-using Microsoft.SqlServer.TransactSql.ScriptDom;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace RevisorScripstSQL.Core
 {
@@ -11,7 +12,8 @@ namespace RevisorScripstSQL.Core
     {
         public void GenerarArchivoCorregido(string archivo, List<SqlError> errores, string rutaRaiz)
         {
-            var lineasOriginales = File.ReadAllLines(archivo).ToList();
+            var encoding = DetectarEncoding(archivo);
+            var lineasOriginales = File.ReadAllLines(archivo, encoding).ToList();
             var lineasCorregidas = new List<string>(lineasOriginales);
 
             int offset = 0;
@@ -267,8 +269,16 @@ namespace RevisorScripstSQL.Core
                 if (!string.IsNullOrWhiteSpace(resultado))
                 {
                     resultado = RestaurarComentariosInline(resultado, comentariosAlias);
+
+                    resultado = Regex.Replace(resultado,
+                        @"\b((?:LEFT|RIGHT|INNER|FULL|CROSS)\s+(?:OUTER\s+)?JOIN|JOIN)\s*\r?\n\s+",
+                        m => m.Groups[1].Value + " ",
+                        RegexOptions.IgnoreCase);
+
                     lineasCorregidas = resultado.Split(Environment.NewLine).ToList();
                 }
+                resultado = ColapsarJoinsSimples(resultado);
+                lineasCorregidas = resultado.Split(Environment.NewLine).ToList();
             }
 
             var sqlFinal = string.Join(Environment.NewLine, lineasCorregidas);
@@ -301,7 +311,7 @@ namespace RevisorScripstSQL.Core
 
             var rutaCorregido = Path.Combine(carpetaSalida, $"{nombreArchivo}_FIX.sql");
 
-            File.WriteAllText(rutaCorregido, sqlFinal);
+            File.WriteAllText(rutaCorregido, sqlFinal, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
         }
 
 
@@ -322,25 +332,43 @@ namespace RevisorScripstSQL.Core
 
             foreach (var info in visitor.Tablas)
             {
-                int lineIdx = info.Tabla.StartLine - 1; 
+                int lineIdx = info.Tabla.StartLine - 1;
 
                 if (lineIdx < 0 || lineIdx >= lineas.Count) continue;
                 if (procesadas.Contains(lineIdx)) continue;
-                procesadas.Add(lineIdx);
 
                 var linea = lineas[lineIdx];
 
                 if (linea.Contains("NOLOCK", StringComparison.OrdinalIgnoreCase)) continue;
                 if (!Regex.IsMatch(linea, @"\b(FROM|JOIN)\b", RegexOptions.IgnoreCase)) continue;
 
+                if (Regex.IsMatch(linea, @"\btemporales\.", RegexOptions.IgnoreCase)) continue;
+                if (Regex.IsMatch(linea, @"\b#\w+")) continue;
+
+                bool enContextoDelete = false;
+                for (int back = lineIdx - 1; back >= Math.Max(0, lineIdx - 15); back--)
+                {
+                    var lineaBack = lineas[back].Trim();
+                    if (Regex.IsMatch(lineaBack, @"^DELETE\b", RegexOptions.IgnoreCase))
+                    {
+                        enContextoDelete = true;
+                        break;
+                    }
+                    if (Regex.IsMatch(lineaBack, @"^(SELECT|INSERT|BEGIN|GO)\b", RegexOptions.IgnoreCase))
+                        break;
+                }
+                if (enContextoDelete) continue;
+
+                procesadas.Add(lineIdx);
+
                 lineas[lineIdx] = Regex.Replace(
                     linea,
                     @"\b(FROM|INNER\s+JOIN|LEFT\s+(?:OUTER\s+)?JOIN|RIGHT\s+(?:OUTER\s+)?JOIN|FULL\s+(?:OUTER\s+)?JOIN|JOIN)\s+([\w\.\[\]@]+)(\s+(?:AS\s+)?[\w]+)?(?=\s+(?:ON|WITH|WHERE|INNER|LEFT|RIGHT|CROSS|FULL|$)|\s*$)",
-                    m =>
+                    mm =>
                     {
-                        var kw = m.Groups[1].Value;
-                        var tabla = m.Groups[2].Value;
-                        var alias = m.Groups[3].Value;
+                        var kw = mm.Groups[1].Value;
+                        var tabla = mm.Groups[2].Value;
+                        var alias = mm.Groups[3].Value;
                         return $"{kw} {tabla}{alias} WITH (NOLOCK)";
                     },
                     RegexOptions.IgnoreCase);
@@ -486,28 +514,100 @@ namespace RevisorScripstSQL.Core
         {
             return Regex.Replace(
                 sql,
-                @"(CREATE\s+OR\s+ALTER\s+PROCEDURE\s+[^\r\n]+\r?\n)([\s\S]*?)(\r?\nAS\b)",
+                @"(CREATE\s+OR\s+ALTER\s+PROCEDURE\s+[\[\]\w\.]+)([\s\S]*?)(\r?\nAS\b)",
                 m =>
                 {
-                    var encabezado = m.Groups[1].Value;
-                    var parametros = m.Groups[2].Value;
+                    var nombre = m.Groups[1].Value;
+                    var bloque = m.Groups[2].Value;
                     var asKeyword = m.Groups[3].Value;
 
-                    var plano = Regex.Replace(parametros, @"\s+", " ").Trim();
+                    string parametros;
+
+                    if (bloque.TrimStart().StartsWith("("))
+                    {
+                        int inicio = bloque.IndexOf('(');
+                        int nivel = 0, fin = -1;
+                        for (int i = inicio; i < bloque.Length; i++)
+                        {
+                            if (bloque[i] == '(') nivel++;
+                            else if (bloque[i] == ')') { nivel--; if (nivel == 0) { fin = i; break; } }
+                        }
+                        if (fin == -1) return m.Value;
+                        parametros = bloque.Substring(inicio + 1, fin - inicio - 1);
+                    }
+                    else
+                    {
+                        parametros = bloque;
+                    }
+
+                    var plano = Regex.Replace(parametros, @"[\r\n\t ]+", " ").Trim();
+                    plano = plano.TrimStart(',').Trim();
+
                     if (string.IsNullOrWhiteSpace(plano)) return m.Value;
 
-                    var lista = plano
-                        .Split(',')
+                    var lista = SplitParamsRespetandoParentesis(plano)
                         .Select(p => p.Trim())
                         .Where(p => !string.IsNullOrWhiteSpace(p))
                         .Select(p => Regex.Replace(p, @"\s*=\s*", " = "));
 
-                    var formateado = "    " + string.Join(
-                        "," + Environment.NewLine + "    ", lista);
+                    var formateado = string.Join("," + Environment.NewLine + "    ", lista);
 
-                    return encabezado + formateado + asKeyword;
+                    return nombre + "(" + Environment.NewLine +
+                           "    " + formateado + Environment.NewLine +
+                           ")" + asKeyword;
                 },
                 RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        }
+        private static List<string> SplitParamsRespetandoParentesis(string parametros)
+        {
+            var result = new List<string>();
+            int nivel = 0, inicio = 0;
+
+            for (int i = 0; i < parametros.Length; i++)
+            {
+                if (parametros[i] == '(') nivel++;
+                else if (parametros[i] == ')') nivel--;
+                else if (parametros[i] == ',' && nivel == 0)
+                {
+                    result.Add(parametros.Substring(inicio, i - inicio));
+                    inicio = i + 1;
+                }
+            }
+            if (inicio < parametros.Length)
+                result.Add(parametros.Substring(inicio));
+
+            return result;
+        }
+        private static string ColapsarJoinsSimples(string sql)
+        {
+            sql = Regex.Replace(sql,
+                @"\b((?:LEFT|RIGHT|INNER|FULL|CROSS)\s+(?:OUTER\s+)?JOIN|JOIN)\s*\r?\n[ \t]+(?!\()",
+                m => m.Groups[1].Value + " ",
+                RegexOptions.IgnoreCase);
+
+            sql = Regex.Replace(sql,
+                @"(\bWITH\s*\(NOLOCK\))\s*\r?\n[ \t]+(ON\b[^\r\n]+)",
+                m => m.Groups[1].Value + " " + m.Groups[2].Value,
+                RegexOptions.IgnoreCase);
+
+            sql = Regex.Replace(sql,
+                @"(?<![)\s])\b([\w\]]+)\s*\r?\n[ \t]+(ON\b[^\r\n]+)",
+                m => m.Groups[1].Value + " " + m.Groups[2].Value,
+                RegexOptions.IgnoreCase);
+
+            return sql;
+        }
+        private static Encoding DetectarEncoding(string archivo)
+        {
+            var bom = new byte[4];
+            using (var file = new FileStream(archivo, FileMode.Open, FileAccess.Read))
+                file.Read(bom, 0, 4);
+
+            if (bom[0] == 0xef && bom[1] == 0xbb && bom[2] == 0xbf) return Encoding.UTF8;
+            if (bom[0] == 0xff && bom[1] == 0xfe) return Encoding.Unicode;
+            if (bom[0] == 0xfe && bom[1] == 0xff) return Encoding.BigEndianUnicode;
+
+            return Encoding.GetEncoding(1252);
         }
     }
 }

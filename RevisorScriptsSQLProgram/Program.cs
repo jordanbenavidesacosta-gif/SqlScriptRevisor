@@ -3,6 +3,8 @@ using System.Text;
 
 var log = new StringBuilder();
 
+System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+
 void Log(string mensaje)
 {
     Console.WriteLine(mensaje);
